@@ -273,6 +273,8 @@ def train(args: Dict[str, str]):
                 hidden_size=int(args['--hidden-size']),
                 dropout_rate=float(args['--dropout']),
                 vocab=vocab)
+
+    model.apply(init_weights)
     optimizer = torch.optim.SGD(model.parameters(), lr = float(args['--lr']))
 
     num_trial = 0
@@ -311,7 +313,7 @@ def train(args: Dict[str, str]):
                                                                                          math.exp(report_loss / report_tgt_words),
                                                                                          cumulative_examples,
                                                                                          report_tgt_words / (time.time() - train_time),
-                                                                                         time.time() - begin_time), file=sys.stderr)
+                                                                                         time.time() - begin_time))
 
                 train_time = time.time()
                 report_loss = report_tgt_words = report_examples = 0.
@@ -326,47 +328,47 @@ def train(args: Dict[str, str]):
                 print('epoch %d, iter %d, cum. loss %.2f, cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
                                                                                          cum_loss / cumulative_examples,
                                                                                          np.exp(cum_loss / cumulative_tgt_words),
-                                                                                         cumulative_examples), file=sys.stderr)
+                                                                                         cumulative_examples))
 
                 cum_loss = cumulative_examples = cumulative_tgt_words = 0.
                 valid_num += 1
 
-                print('begin validation ...', file=sys.stderr)
+                print('begin validation ...')
 
                 # compute dev. ppl and bleu
                 dev_ppl = model.evaluate_ppl(dev_data, batch_size=128)   # dev batch size can be a bit larger
                 valid_metric = -dev_ppl
 
-                print('validation: iter %d, dev. ppl %f' % (train_iter, dev_ppl), file=sys.stderr)
+                print('validation: iter %d, dev. ppl %f' % (train_iter, dev_ppl))
 
                 is_better = len(hist_valid_scores) == 0 or valid_metric > max(hist_valid_scores)
                 hist_valid_scores.append(valid_metric)
 
                 if is_better:
                     patience = 0
-                    print('save currently the best model to [%s]' % model_save_path, file=sys.stderr)
+                    print('save currently the best model to [%s]' % model_save_path)
                     model.save(model_save_path)
 
                     # You may also save the optimizer's state
                 elif patience < int(args['--patience']):
                     patience += 1
-                    print('hit patience %d' % patience, file=sys.stderr)
+                    print('hit patience %d' % patience)
 
                     if patience == int(args['--patience']):
                         num_trial += 1
-                        print('hit #%d trial' % num_trial, file=sys.stderr)
+                        print('hit #%d trial' % num_trial)
                         if num_trial == int(args['--max-num-trial']):
-                            print('early stop!', file=sys.stderr)
+                            print('early stop!')
                             exit(0)
 
                         # decay learning rate, and restore from previously best checkpoint
                         lr = lr * float(args['--lr-decay'])
-                        print('load previously best model and decay learning rate to %f' % lr, file=sys.stderr)
+                        print('load previously best model and decay learning rate to %f' % lr)
 
                         # load model
                         model = NMT.load(model_save_path)
 
-                        print('restore parameters of the optimizers', file=sys.stderr)
+                        print('restore parameters of the optimizers')
                         # You may also need to load the state of the optimizer saved before
                         # TODO
 
@@ -374,7 +376,7 @@ def train(args: Dict[str, str]):
                         patience = 0
 
                 if epoch == int(args['--max-epoch']):
-                    print('reached maximum number of epochs!', file=sys.stderr)
+                    print('reached maximum number of epochs!')
                     exit(0)
 
 
@@ -400,7 +402,7 @@ def decode(args: Dict[str, str]):
     if args['TEST_TARGET_FILE']:
         test_data_tgt = read_corpus(args['TEST_TARGET_FILE'], source='tgt')
 
-    print(f"load model from {args['MODEL_PATH']}", file=sys.stderr)
+    print(f"load model from {args['MODEL_PATH']}")
     model = NMT.load(args['MODEL_PATH'])
 
     hypotheses = beam_search(model, test_data_src,
@@ -410,13 +412,20 @@ def decode(args: Dict[str, str]):
     if args['TEST_TARGET_FILE']:
         top_hypotheses = [hyps[0] for hyps in hypotheses] # Find the sentence with the highest likelihood
         bleu_score = compute_corpus_level_bleu_score(test_data_tgt, top_hypotheses)
-        print(f'Corpus BLEU: {bleu_score}', file=sys.stderr)
+        print(f'Corpus BLEU: {bleu_score}')
 
     with open(args['OUTPUT_FILE'], 'w') as f:
         for src_sent, hyps in zip(test_data_src, hypotheses):
             top_hyp = hyps[0]
             hyp_sent = ' '.join(top_hyp.value)
             f.write(hyp_sent + '\n')
+
+def init_weights(m):
+    """
+    helper function that initializes the parameters uniformly between -0.1 and 0.1
+    """
+    for name, param in m.named_parameters():
+        nn.init.uniform_(param.data, -0.1, 0.1)
 
 
 def main():
@@ -426,6 +435,7 @@ def main():
     # also want to seed the RNG of tensorflow, pytorch, dynet, etc.
     seed = int(args['--seed'])
     np.random.seed(seed * 13 // 7)
+    torch.manual_seed(seed * 13 // 7)
 
     if args['train']:
         train(args)
