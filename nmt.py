@@ -42,6 +42,11 @@ import time
 from collections import namedtuple
 
 import numpy as np
+
+import torch
+from torch import nn
+import torch.nn.utils.rnn as rnn
+
 from typing import List, Tuple, Dict, Set, Union
 from docopt import docopt
 from tqdm import tqdm
@@ -54,7 +59,7 @@ from vocab import Vocab, VocabEntry
 Hypothesis = namedtuple('Hypothesis', ['value', 'score'])
 
 
-class NMT(object):
+class NMT(nn.Module):
 
     def __init__(self, embed_size, hidden_size, vocab, dropout_rate=0.2):
         super(NMT, self).__init__()
@@ -65,8 +70,17 @@ class NMT(object):
         self.vocab = vocab
 
         # initialize neural network layers...
+        self.encoder_embed = nn.Embedding(len(vocab.src), embed_size)
+        self.encoder = nn.LSTM(embed_size, hidden_size // 2, 1, batch_first = True, bidirectional = True)
 
-    def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]]) -> Tensor:
+
+        self.decoder_embed = nn.Embedding(len(vocab.tgt), embed_size)
+        self.decoder = nn.LSTM(embed_size, hidden_size, batch_first = True)
+
+        self.final = nn.Linear(hidden_size, len(vocab.tgt))
+        self.loss = nn.CrossEntropyLoss(ignore_index = 0, reduction = 'sum')
+
+    def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]]) -> torch.Tensor:
         """
         take a mini-batch of source and target sentences, compute the log-likelihood of 
         target sentences.
@@ -80,12 +94,12 @@ class NMT(object):
                 log-likelihood of generating the gold-standard target sentence for 
                 each example in the input batch
         """
-        src_encodings, decoder_init_state = self.encode(src_sents, tgt_sents)
+        src_encodings, decoder_init_state = self.encode(src_sents)
         scores = self.decode(src_encodings, decoder_init_state, tgt_sents)
 
         return scores
 
-    def encode(self, src_sents: List[List[str]]) -> Tuple[Tensor, Any]:
+    def encode(self, src_sents: List[List[str]]) -> Tuple[torch.Tensor, Tuple]:
         """
         Use a GRU/LSTM to encode source sentences into hidden states
 
@@ -94,13 +108,27 @@ class NMT(object):
 
         Returns:
             src_encodings: hidden states of tokens in source sentences, this could be a variable 
-                with shape (batch_size, source_sentence_length, encoding_dim), or in orther formats
+                with shape (batch_size, source_sentence_length, encoding_dim), or in other formats
             decoder_init_state: decoder GRU/LSTM's initial state, computed from source encodings
         """
+        # 1. one-hot
+        one_hot = self.vocab.src.words2indices(src_sents)
+        lengths = torch.tensor([len(s) for s in one_hot])
+        padded_one_hot_tensor = rnn.pad_sequence([torch.tensor(s) for s in one_hot], batch_first = True) # (batch_size, seq_len)
 
-        return src_encodings, decoder_init_state
+        # 2. Embedding 
+        embedding = self.encoder_embed(padded_one_hot_tensor) # (batch_size, seq_len, embed_size)
 
-    def decode(self, src_encodings: Tensor, decoder_init_state: Any, tgt_sents: List[List[str]]) -> Tensor:
+        # 3. LSTM
+        packed_embedding = rnn.pack_padded_sequence(embedding, lengths, batch_first = True, enforce_sorted = False)       
+        src_encodings, decoder_init_state = self.encoder(packed_embedding)
+ 
+        h = decoder_init_state[0].transpose(0, 1).reshape(1, len(lengths), -1) # (1, batch_size, hidden_size)
+        c = decoder_init_state[1].transpose(0, 1).reshape(1, len(lengths), -1)
+
+        return src_encodings, (h, c)
+
+    def decode(self, src_encodings: torch.Tensor, decoder_init_state: Tuple, tgt_sents: List[List[str]]) -> torch.Tensor:
         """
         Given source encodings, compute the log-likelihood of predicting the gold-standard target
         sentence tokens
@@ -115,6 +143,26 @@ class NMT(object):
                 log-likelihood of generating the gold-standard target sentence for 
                 each example in the input batch
         """
+        # 1. one-hot
+        one_hot = self.vocab.tgt.words2indices(tgt_sents)
+        lengths = torch.tensor([len(s) - 1 for s in one_hot])
+        padded_one_hot_tensor = rnn.pad_sequence([torch.tensor(s[:-1]) for s in one_hot], batch_first = True) # (batch_size, seq_len)
+
+        # 2. Embedding 
+        embedding = self.decoder_embed(padded_one_hot_tensor) # (batch_size, seq_len, embed_size)
+
+        # 3. LSTM
+        packed_embedding = rnn.pack_padded_sequence(embedding, lengths, batch_first = True, enforce_sorted = False)       
+
+        lstm_output, _ = self.decoder(packed_embedding, decoder_init_state)
+        padded_lstm_output, _ = rnn.pad_packed_sequence(lstm_output, batch_first = True) # (batch_size, seq_len, output_size)
+
+        # 4. Linear layer
+        logits = self.final(padded_lstm_output) # (batch_size, seq_len, tgt_vocab_size)
+
+        # 5. Calculate loss
+        target = rnn.pad_sequence([torch.tensor(s[1:]) for s in one_hot]) # (batch_size, seq_len)
+        scores = self.loss(logits.transpose(1, 2), target.transpose(0, 1)) 
 
         return scores
 
@@ -135,7 +183,7 @@ class NMT(object):
 
         return hypotheses
 
-    def evaluate_ppl(self, dev_data: List[Any], batch_size: int=32):
+    def evaluate_ppl(self, dev_data: List[List[str]], batch_size: int=32):
         """
         Evaluate perplexity on dev sentences
 
@@ -155,7 +203,7 @@ class NMT(object):
         # e.g., `torch.no_grad()`
 
         for src_sents, tgt_sents in batch_iter(dev_data, batch_size):
-            loss = -model(src_sents, tgt_sents).sum()
+            loss = model(src_sents, tgt_sents)
 
             cum_loss += loss
             tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting the leading `<s>`
@@ -173,15 +221,14 @@ class NMT(object):
         Returns:
             model: the loaded model
         """
-
+        model = torch.load(model_path)
         return model
 
     def save(self, path: str):
         """
         Save current model to file
         """
-
-        raise NotImplementedError()
+        torch.save(self, path)
 
 
 def compute_corpus_level_bleu_score(references: List[List[str]], hypotheses: List[Hypothesis]) -> float:
@@ -205,7 +252,7 @@ def compute_corpus_level_bleu_score(references: List[List[str]], hypotheses: Lis
 
 
 def train(args: Dict[str, str]):
-    train_data_src = read_corpus(args['--train-src'], source='src')
+    train_data_src = read_corpus(args['--train-src'], source='src') # List of tokenized sentences
     train_data_tgt = read_corpus(args['--train-tgt'], source='tgt')
 
     dev_data_src = read_corpus(args['--dev-src'], source='src')
@@ -226,6 +273,7 @@ def train(args: Dict[str, str]):
                 hidden_size=int(args['--hidden-size']),
                 dropout_rate=float(args['--dropout']),
                 vocab=vocab)
+    optimizer = torch.optim.SGD(model.parameters(), lr = float(args['--lr']))
 
     num_trial = 0
     train_iter = patience = cum_loss = report_loss = cumulative_tgt_words = report_tgt_words = 0
@@ -243,7 +291,9 @@ def train(args: Dict[str, str]):
             batch_size = len(src_sents)
 
             # (batch_size)
-            loss = -model(src_sents, tgt_sents)
+            loss = model(src_sents, tgt_sents)
+            loss.backward()
+            optimizer.step()
 
             report_loss += loss
             cum_loss += loss
@@ -314,10 +364,11 @@ def train(args: Dict[str, str]):
                         print('load previously best model and decay learning rate to %f' % lr, file=sys.stderr)
 
                         # load model
-                        model_save_path
+                        model = NMT.load(model_save_path)
 
                         print('restore parameters of the optimizers', file=sys.stderr)
                         # You may also need to load the state of the optimizer saved before
+                        # TODO
 
                         # reset patience
                         patience = 0
@@ -357,7 +408,7 @@ def decode(args: Dict[str, str]):
                              max_decoding_time_step=int(args['--max-decoding-time-step']))
 
     if args['TEST_TARGET_FILE']:
-        top_hypotheses = [hyps[0] for hyps in hypotheses]
+        top_hypotheses = [hyps[0] for hyps in hypotheses] # Find the sentence with the highest likelihood
         bleu_score = compute_corpus_level_bleu_score(test_data_tgt, top_hypotheses)
         print(f'Corpus BLEU: {bleu_score}', file=sys.stderr)
 
