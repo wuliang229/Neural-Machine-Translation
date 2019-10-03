@@ -215,8 +215,50 @@ class NMT(nn.Module):
                 value: List[str]: the decoded target sentence, represented as a list of words
                 score: float: the log-likelihood of the target sentence
         """
+        src_encodings, decoder_init_state = self.encode([src_sent])
+        current_word = torch.ones(1, 1).long() # start of sentence <s>
 
-        return hypotheses
+        # 2. Unpack src_encodings
+        padded_src_encodings, src_lengths = rnn.pad_packed_sequence(src_encodings, batch_first = True) # (batch_size, seq_len, hidden_size)
+
+        current_decoder_state = decoder_init_state
+        entire_output = None
+
+        current_embedding = torch.zeros(1, 1, padded_src_encodings.size(2))
+
+        result = [[]]
+        for i in range(max_decoding_time_step):
+
+            embedding = self.decoder_embed(current_word) # (batch_size, 1, embed_size)
+
+            current_embedding = torch.cat((current_embedding, embedding), dim = 2) # (batch, embed + hidden)
+
+            lstm_output, current_decoder_state = self.decoder(current_embedding, current_decoder_state) # (batch_size, 1, hidden_size)
+
+            alignment_vector = torch.bmm(padded_src_encodings, lstm_output.transpose(1, 2)).view(1, -1) # (batch_size, hidden_size)
+
+            mask = torch.arange(alignment_vector.size(1)) < src_lengths.unsqueeze(1)
+
+            alignment_vector = mask.float() * torch.softmax(alignment_vector, dim = 1)
+
+            masked_attention = alignment_vector / torch.sum(alignment_vector, dim = 1).unsqueeze(1) # (batch, seq_len)
+
+            weighted_average = torch.bmm(padded_src_encodings.transpose(1, 2), masked_attention.unsqueeze(2)).transpose(1, 2) # (batch, 1, hidden)
+ 
+            concatenated_output = self.dropout(torch.cat((weighted_average, lstm_output), dim = 2)) # (batch, 1, hidden * 2)
+
+            current_embedding = weighted_average
+
+            logits = self.Ws(concatenated_output)
+
+            current_word = torch.argmax(logits, dim = 2)
+
+            if current_word[0,0] == 2: # End of sentence </s>
+                break
+
+            result[0].append(self.vocab.tgt.id2word[current_word[0,0].item()]) 
+
+        return result
 
     def evaluate_ppl(self, dev_data: List[List[str]], batch_size: int=32):
         """
@@ -435,8 +477,8 @@ def decode(args: Dict[str, str]):
     corpus-level BLEU score.
     """
     test_data_src = read_corpus(args['TEST_SOURCE_FILE'], source='src')
-    if args['TEST_TARGET_FILE']:
-        test_data_tgt = read_corpus(args['TEST_TARGET_FILE'], source='tgt')
+    # if args['TEST_TARGET_FILE']:
+    #     test_data_tgt = read_corpus(args['TEST_TARGET_FILE'], source='tgt')
 
     print(f"load model from {args['MODEL_PATH']}")
     model = NMT.load(args['MODEL_PATH'])
@@ -446,15 +488,15 @@ def decode(args: Dict[str, str]):
                              beam_size=int(args['--beam-size']),
                              max_decoding_time_step=int(args['--max-decoding-time-step']))
 
-    if args['TEST_TARGET_FILE']:
-        top_hypotheses = [hyps[0] for hyps in hypotheses] # Find the sentence with the highest likelihood
-        bleu_score = compute_corpus_level_bleu_score(test_data_tgt, top_hypotheses)
-        print(f'Corpus BLEU: {bleu_score}')
+    # if args['TEST_TARGET_FILE']:
+    #     top_hypotheses = [hyps[0] for hyps in hypotheses] # Find the sentence with the highest likelihood
+    #     bleu_score = compute_corpus_level_bleu_score(test_data_tgt, top_hypotheses)
+    #     print(f'Corpus BLEU: {bleu_score}')
 
     with open(args['OUTPUT_FILE'], 'w') as f:
-        for src_sent, hyps in zip(test_data_src, hypotheses):
+        for hyps in hypotheses:
             top_hyp = hyps[0]
-            hyp_sent = ' '.join(top_hyp.value)
+            hyp_sent = ' '.join(top_hyp)
             f.write(hyp_sent + '\n')
 
 def init_weights(m):
