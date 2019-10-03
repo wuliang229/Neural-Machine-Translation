@@ -67,7 +67,7 @@ class NMT(nn.Module):
 
         self.embed_size = embed_size
         self.hidden_size = hidden_size
-        self.dropout_rate = dropout_rate # TODO
+        self.dropout_rate = dropout_rate
         self.vocab = vocab
 
         # Encoder
@@ -81,6 +81,7 @@ class NMT(nn.Module):
         # Final output
         self.Ws = nn.Linear(2 * hidden_size, len(vocab.tgt))
         self.loss = nn.CrossEntropyLoss(ignore_index = 0, reduction = 'sum')
+        self.dropout = nn.Dropout(dropout_rate)
 
     def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]]) -> torch.Tensor:
         """
@@ -180,7 +181,7 @@ class NMT(nn.Module):
 
             weighted_average = torch.bmm(padded_src_encodings.transpose(1, 2), masked_attention.unsqueeze(2)).transpose(1, 2) # (batch, 1, hidden)
  
-            concatenated_output = torch.cat((weighted_average, lstm_output), dim = 2) # (batch, 1, hidden * 2)
+            concatenated_output = self.dropout(torch.cat((weighted_average, lstm_output), dim = 2)) # (batch, 1, hidden * 2)
 
             current_embedding = weighted_average
 
@@ -417,7 +418,6 @@ def train(args: Dict[str, str]):
 
 
 def beam_search(model: NMT, test_data_src: List[List[str]], beam_size: int, max_decoding_time_step: int) -> List[List[Hypothesis]]:
-    was_training = model.training
 
     hypotheses = []
     for src_sent in tqdm(test_data_src, desc='Decoding', file=sys.stdout):
