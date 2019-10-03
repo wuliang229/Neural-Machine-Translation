@@ -46,6 +46,7 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.utils.rnn as rnn
+import torch.nn.functional as F
 
 from typing import List, Tuple, Dict, Set, Union
 from docopt import docopt
@@ -66,18 +67,19 @@ class NMT(nn.Module):
 
         self.embed_size = embed_size
         self.hidden_size = hidden_size
-        self.dropout_rate = dropout_rate
+        self.dropout_rate = dropout_rate # TODO
         self.vocab = vocab
 
-        # initialize neural network layers...
+        # Encoder
         self.encoder_embed = nn.Embedding(len(vocab.src), embed_size)
         self.encoder = nn.LSTM(embed_size, hidden_size // 2, 1, batch_first = True, bidirectional = True)
 
-
+        # Decoder
         self.decoder_embed = nn.Embedding(len(vocab.tgt), embed_size)
         self.decoder = nn.LSTM(embed_size, hidden_size, batch_first = True)
 
-        self.final = nn.Linear(hidden_size, len(vocab.tgt))
+        # Final output
+        self.Ws = nn.Linear(2 * hidden_size, len(vocab.tgt))
         self.loss = nn.CrossEntropyLoss(ignore_index = 0, reduction = 'sum')
 
     def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]]) -> torch.Tensor:
@@ -148,20 +150,48 @@ class NMT(nn.Module):
         lengths = torch.tensor([len(s) - 1 for s in one_hot])
         padded_one_hot_tensor = rnn.pad_sequence([torch.tensor(s[:-1]) for s in one_hot], batch_first = True) # (batch_size, seq_len)
 
-        # 2. Embedding 
+        # 2. Unpack src_encodings
+        padded_src_encodings, src_lengths = rnn.pad_packed_sequence(src_encodings, batch_first = True) # (batch_size, seq_len, hidden_size)
+
+        # 3. Embedding 
         embedding = self.decoder_embed(padded_one_hot_tensor) # (batch_size, seq_len, embed_size)
 
-        # 3. LSTM
-        packed_embedding = rnn.pack_padded_sequence(embedding, lengths, batch_first = True, enforce_sorted = False)       
+        # 4. Decode step by step with attention
+        current_decoder_state = decoder_init_state
+        entire_output = None
 
-        lstm_output, _ = self.decoder(packed_embedding, decoder_init_state)
-        padded_lstm_output, _ = rnn.pad_packed_sequence(lstm_output, batch_first = True) # (batch_size, seq_len, output_size)
+        for i in range(embedding.size(1)):
 
-        # 4. Linear layer
-        logits = self.final(padded_lstm_output) # (batch_size, seq_len, tgt_vocab_size)
+            current_embedding = embedding[:, i:i+1, :]
 
-        # 5. Calculate loss
+            # 4.1 LSTM
+            lstm_output, current_decoder_state = self.decoder(current_embedding, current_decoder_state) # (batch_size, 1, hidden_size)
+
+            # 4.2 Attention
+            alignment_vector = torch.bmm(padded_src_encodings, lstm_output.transpose(1, 2)).view(len(lengths), -1) # (batch_size, hidden_size)
+
+            mask = torch.arange(alignment_vector.size(1)) < src_lengths.unsqueeze(1)
+
+            alignment_vector = mask.float() * torch.softmax(alignment_vector, dim = 1)
+
+            masked_attention = alignment_vector / torch.sum(alignment_vector, dim = 1).unsqueeze(1) # (batch, seq_len)
+
+            weighted_average = torch.bmm(padded_src_encodings.transpose(1, 2), masked_attention.unsqueeze(2)).transpose(1, 2) # (batch, 1, hidden)
+ 
+            concatenated_output = torch.cat((weighted_average, lstm_output), dim = 2) # (batch, 1, hidden * 2)
+
+            # Accumulate outputs
+            if entire_output is None:
+                entire_output = concatenated_output
+            else:
+                entire_output = torch.cat((entire_output, concatenated_output), dim = 1)
+
+        # 5. Final layer
+        logits = self.Ws(entire_output) # (batch_size, seq_len, tgt_vocab_size)
+
+        # 6. Calculate loss
         target = rnn.pad_sequence([torch.tensor(s[1:]) for s in one_hot]) # (batch_size, seq_len)
+
         scores = self.loss(logits.transpose(1, 2), target.transpose(0, 1)) 
 
         return scores
@@ -286,6 +316,7 @@ def train(args: Dict[str, str]):
 
     while True:
         epoch += 1
+        model.train()
 
         for src_sents, tgt_sents in batch_iter(train_data, batch_size=train_batch_size, shuffle=True):
             train_iter += 1
@@ -336,6 +367,7 @@ def train(args: Dict[str, str]):
                 print('begin validation ...')
 
                 # compute dev. ppl and bleu
+                model.eval()
                 dev_ppl = model.evaluate_ppl(dev_data, batch_size=128)   # dev batch size can be a bit larger
                 valid_metric = -dev_ppl
 
@@ -404,6 +436,7 @@ def decode(args: Dict[str, str]):
 
     print(f"load model from {args['MODEL_PATH']}")
     model = NMT.load(args['MODEL_PATH'])
+    model.eval()
 
     hypotheses = beam_search(model, test_data_src,
                              beam_size=int(args['--beam-size']),
