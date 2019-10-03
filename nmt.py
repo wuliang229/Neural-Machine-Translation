@@ -76,7 +76,7 @@ class NMT(nn.Module):
 
         # Decoder
         self.decoder_embed = nn.Embedding(len(vocab.tgt), embed_size)
-        self.decoder = nn.LSTM(embed_size, hidden_size, batch_first = True)
+        self.decoder = nn.LSTM(embed_size + hidden_size, hidden_size, batch_first = True)
 
         # Final output
         self.Ws = nn.Linear(2 * hidden_size, len(vocab.tgt))
@@ -160,9 +160,11 @@ class NMT(nn.Module):
         current_decoder_state = decoder_init_state
         entire_output = None
 
+        current_embedding = torch.zeros(embedding.size(0), 1, padded_src_encodings.size(2))
+
         for i in range(embedding.size(1)):
 
-            current_embedding = embedding[:, i:i+1, :]
+            current_embedding = torch.cat((current_embedding, embedding[:, i:i+1, :]), dim = 2) # (batch, embed + hidden)
 
             # 4.1 LSTM
             lstm_output, current_decoder_state = self.decoder(current_embedding, current_decoder_state) # (batch_size, 1, hidden_size)
@@ -179,6 +181,8 @@ class NMT(nn.Module):
             weighted_average = torch.bmm(padded_src_encodings.transpose(1, 2), masked_attention.unsqueeze(2)).transpose(1, 2) # (batch, 1, hidden)
  
             concatenated_output = torch.cat((weighted_average, lstm_output), dim = 2) # (batch, 1, hidden * 2)
+
+            current_embedding = weighted_average
 
             # Accumulate outputs
             if entire_output is None:
