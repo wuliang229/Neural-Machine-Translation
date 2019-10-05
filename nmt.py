@@ -17,9 +17,9 @@ Options:
     --dev-tgt=<file>                        dev target file
     --vocab=<file>                          vocab file
     --seed=<int>                            seed [default: 0]
-    --batch-size=<int>                      batch size [default: 32]
+    --batch-size=<int>                      batch size [default: 64]
     --embed-size=<int>                      embedding size [default: 256]
-    --hidden-size=<int>                     hidden size [default: 256]
+    --hidden-size=<int>                     hidden size [default: 512]
     --clip-grad=<float>                     gradient clipping [default: 5.0]
     --log-every=<int>                       log every [default: 10]
     --max-epoch=<int>                       max epoch [default: 30]
@@ -83,6 +83,11 @@ class NMT(nn.Module):
         self.loss = nn.CrossEntropyLoss(ignore_index = 0, reduction = 'sum')
         self.dropout = nn.Dropout(dropout_rate)
 
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        self.to(self.device)
+
+
     def __call__(self, src_sents: List[List[str]], tgt_sents: List[List[str]]) -> torch.Tensor:
         """
         take a mini-batch of source and target sentences, compute the log-likelihood of 
@@ -116,8 +121,8 @@ class NMT(nn.Module):
         """
         # 1. one-hot
         one_hot = self.vocab.src.words2indices(src_sents)
-        lengths = torch.tensor([len(s) for s in one_hot])
-        padded_one_hot_tensor = rnn.pad_sequence([torch.tensor(s) for s in one_hot], batch_first = True) # (batch_size, seq_len)
+        lengths = torch.tensor([len(s) for s in one_hot]).to(self.device)
+        padded_one_hot_tensor = rnn.pad_sequence([torch.tensor(s) for s in one_hot], batch_first = True).to(self.device) # (batch_size, seq_len)
 
         # 2. Embedding 
         embedding = self.encoder_embed(padded_one_hot_tensor) # (batch_size, seq_len, embed_size)
@@ -128,6 +133,12 @@ class NMT(nn.Module):
  
         h = decoder_init_state[0].transpose(0, 1).reshape(1, len(lengths), -1) # (1, batch_size, hidden_size)
         c = decoder_init_state[1].transpose(0, 1).reshape(1, len(lengths), -1)
+
+        del lengths
+        del padded_one_hot_tensor
+        del embedding
+        del packed_embedding
+        del decoder_init_state
 
         return src_encodings, (h, c)
 
@@ -148,8 +159,8 @@ class NMT(nn.Module):
         """
         # 1. one-hot
         one_hot = self.vocab.tgt.words2indices(tgt_sents)
-        lengths = torch.tensor([len(s) - 1 for s in one_hot])
-        padded_one_hot_tensor = rnn.pad_sequence([torch.tensor(s[:-1]) for s in one_hot], batch_first = True) # (batch_size, seq_len)
+        lengths = torch.tensor([len(s) - 1 for s in one_hot]).to(self.device)
+        padded_one_hot_tensor = rnn.pad_sequence([torch.tensor(s[:-1]) for s in one_hot], batch_first = True).to(self.device) # (batch_size, seq_len)
 
         # 2. Unpack src_encodings
         padded_src_encodings, src_lengths = rnn.pad_packed_sequence(src_encodings, batch_first = True) # (batch_size, seq_len, hidden_size)
@@ -161,7 +172,7 @@ class NMT(nn.Module):
         current_decoder_state = decoder_init_state
         entire_output = None
 
-        current_embedding = torch.zeros(embedding.size(0), 1, padded_src_encodings.size(2))
+        current_embedding = torch.zeros(embedding.size(0), 1, padded_src_encodings.size(2)).to(self.device)
 
         for i in range(embedding.size(1)):
 
@@ -175,7 +186,7 @@ class NMT(nn.Module):
 
             mask = torch.arange(alignment_vector.size(1)) < src_lengths.unsqueeze(1)
 
-            alignment_vector = mask.float() * torch.softmax(alignment_vector, dim = 1)
+            alignment_vector = mask.float().to(self.device) * torch.softmax(alignment_vector, dim = 1)
 
             masked_attention = alignment_vector / torch.sum(alignment_vector, dim = 1).unsqueeze(1) # (batch, seq_len)
 
@@ -195,9 +206,26 @@ class NMT(nn.Module):
         logits = self.Ws(entire_output) # (batch_size, seq_len, tgt_vocab_size)
 
         # 6. Calculate loss
-        target = rnn.pad_sequence([torch.tensor(s[1:]) for s in one_hot]) # (batch_size, seq_len)
+        target = rnn.pad_sequence([torch.tensor(s[1:]) for s in one_hot]).to(self.device) # (batch_size, seq_len)
 
         scores = self.loss(logits.transpose(1, 2), target.transpose(0, 1)) 
+
+        del lengths
+        del padded_one_hot_tensor
+        del padded_src_encodings
+        del src_lengths
+        del embedding
+        del current_decoder_state
+        del entire_output
+        del current_embedding
+        del lstm_output
+        del alignment_vector
+        del mask
+        del masked_attention
+        del weighted_average
+        del concatenated_output
+        del logits
+        del target
 
         return scores
 
@@ -216,7 +244,7 @@ class NMT(nn.Module):
                 score: float: the log-likelihood of the target sentence
         """
         src_encodings, decoder_init_state = self.encode([src_sent])
-        current_word = torch.ones(1, 1).long() # start of sentence <s>
+        current_word = torch.ones(1, 1).long().to(self.device) # start of sentence <s>
 
         # 2. Unpack src_encodings
         padded_src_encodings, src_lengths = rnn.pad_packed_sequence(src_encodings, batch_first = True) # (batch_size, seq_len, hidden_size)
@@ -224,7 +252,7 @@ class NMT(nn.Module):
         current_decoder_state = decoder_init_state
         entire_output = None
 
-        current_embedding = torch.zeros(1, 1, padded_src_encodings.size(2))
+        current_embedding = torch.zeros(1, 1, padded_src_encodings.size(2)).to(self.device)
 
         result = [[]]
         for i in range(max_decoding_time_step):
@@ -239,7 +267,7 @@ class NMT(nn.Module):
 
             mask = torch.arange(alignment_vector.size(1)) < src_lengths.unsqueeze(1)
 
-            alignment_vector = mask.float() * torch.softmax(alignment_vector, dim = 1)
+            alignment_vector = mask.float().to(self.device) * torch.softmax(alignment_vector, dim = 1)
 
             masked_attention = alignment_vector / torch.sum(alignment_vector, dim = 1).unsqueeze(1) # (batch, seq_len)
 
@@ -257,6 +285,23 @@ class NMT(nn.Module):
                 break
 
             result[0].append(self.vocab.tgt.id2word[current_word[0,0].item()]) 
+
+        del src_encodings
+        del decoder_init_state
+        del padded_src_encodings
+        del src_lengths
+        del embedding
+        del current_decoder_state
+        del entire_output
+        del current_embedding
+        del lstm_output
+        del alignment_vector
+        del mask
+        del masked_attention
+        del weighted_average
+        del concatenated_output
+        del logits
+        del current_word
 
         return result
 
@@ -279,14 +324,15 @@ class NMT(nn.Module):
         # by the NN library to signal the backend to not to keep gradient information
         # e.g., `torch.no_grad()`
 
-        for src_sents, tgt_sents in batch_iter(dev_data, batch_size):
-            loss = model(src_sents, tgt_sents)
+        with torch.no_grad():
+            for src_sents, tgt_sents in batch_iter(dev_data, batch_size):
+                loss = self(src_sents, tgt_sents)
 
-            cum_loss += loss
-            tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting the leading `<s>`
-            cum_tgt_words += tgt_word_num_to_predict
+                cum_loss += loss
+                tgt_word_num_to_predict = sum(len(s[1:]) for s in tgt_sents)  # omitting the leading `<s>`
+                cum_tgt_words += tgt_word_num_to_predict
 
-        ppl = np.exp(cum_loss / cum_tgt_words)
+            ppl = math.exp(cum_loss / cum_tgt_words)
 
         return ppl
 
@@ -352,7 +398,7 @@ def train(args: Dict[str, str]):
                 vocab=vocab)
 
     model.apply(init_weights)
-    optimizer = torch.optim.SGD(model.parameters(), lr = float(args['--lr']))
+    optimizer = torch.optim.Adam(model.parameters(), lr = float(args['--lr']))
 
     num_trial = 0
     train_iter = patience = cum_loss = report_loss = cumulative_tgt_words = report_tgt_words = 0
@@ -363,9 +409,11 @@ def train(args: Dict[str, str]):
 
     while True:
         epoch += 1
-        model.train()
 
         for src_sents, tgt_sents in batch_iter(train_data, batch_size=train_batch_size, shuffle=True):
+            model.train()
+            optimizer.zero_grad()
+
             train_iter += 1
 
             batch_size = len(src_sents)
@@ -405,7 +453,7 @@ def train(args: Dict[str, str]):
             if train_iter % valid_niter == 0:
                 print('epoch %d, iter %d, cum. loss %.2f, cum. ppl %.2f cum. examples %d' % (epoch, train_iter,
                                                                                          cum_loss / cumulative_examples,
-                                                                                         np.exp(cum_loss / cumulative_tgt_words),
+                                                                                         math.exp(cum_loss / cumulative_tgt_words),
                                                                                          cumulative_examples))
 
                 cum_loss = cumulative_examples = cumulative_tgt_words = 0.
